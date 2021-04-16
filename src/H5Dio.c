@@ -54,6 +54,11 @@ static herr_t H5D__ioinfo_adjust(H5D_io_info_t *io_info, const H5D_t *dset, cons
 #endif /* H5_HAVE_PARALLEL */
 static herr_t H5D__typeinfo_term(const H5D_type_info_t *type_info);
 
+static herr_t H5D__pre_read(hid_t file_id, hid_t dxpl_id, size_t count,
+    H5D_dset_info_t *dset_info);
+static herr_t H5D__pre_write(hid_t file_id, hid_t dxpl_id, size_t count,
+    H5D_dset_info_t *dset_info);
+
 /*********************/
 /* Package Variables */
 /*********************/
@@ -567,6 +572,477 @@ done:
 
     FUNC_LEAVE_NOAPI_TAG(ret_value)
 } /* end H5D__write() */
+
+
+/* Declare a free list to manage the H5D_chunk_map_t struct */
+/* H5FL_DEFINE(H5D_chunk_map_t); */
+
+
+static hid_t
+H5D__verify_location(size_t count, const H5D_dset_info_t *info)
+{
+    hid_t file_id;
+    size_t u;
+    hid_t ret_value = FAIL;         /* Return value */
+
+    FUNC_ENTER_STATIC
+
+    file_id = H5F_get_file_id(info[0].dset->oloc.file);
+
+    for(u = 1; u < count; u++) {
+        if(file_id != H5F_get_file_id(info[u].dset->oloc.file))
+            HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "dataset's file ID doesn't match file_id parameter")
+    } /* end for */
+
+    ret_value = file_id;
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5D__verify_location */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5D__init_dset_info
+ *
+ * Purpose:     Initializes a H5D_dset_info_t from a set of user parameters,
+ *              while checking parameters too.
+ *
+ * Return:      Non-negative on success/Negative on failure
+ *
+ * Programmer:  Quincey Koziol
+ *              Friday, August 29, 2014
+ *
+ *-------------------------------------------------------------------------
+ */
+
+static herr_t
+H5D__init_dset_info(H5D_dset_info_t *dset_info, hid_t dset_id,
+    hid_t mem_type_id, hid_t mem_space_id, hid_t dset_space_id,
+    const H5D_dset_buf_t *u_buf)
+{
+    herr_t ret_value = SUCCEED;         /* Return value */
+
+    FUNC_ENTER_STATIC
+
+    /* Get dataset */
+    if(NULL == (dset_info->dset = (H5D_t *)H5I_object_verify(dset_id, H5I_DATASET)))
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a dataset")
+    if(NULL == dset_info->dset->oloc.file)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a file")
+
+    /* Check for invalid space IDs */
+    if(mem_space_id < 0 || dset_space_id < 0)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a dataspace")
+
+    /* Get file dataspace */
+    if(H5S_ALL != dset_space_id) {
+        if(NULL == (dset_info->file_space = (const H5S_t *)H5I_object_verify(dset_space_id, H5I_DATASPACE)))
+            HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a dataspace")
+
+        /* Check for valid selection */
+        if(H5S_SELECT_VALID(dset_info->file_space) != TRUE)
+            HGOTO_ERROR(H5E_DATASPACE, H5E_BADRANGE, FAIL, "file selection+offset not within extent")
+    } /* end if */
+    else
+        dset_info->file_space = dset_info->dset->shared->space;
+
+    /* Get memory dataspace */
+    if(H5S_ALL != mem_space_id) {
+        if(NULL == (dset_info->mem_space = (const H5S_t *)H5I_object_verify(mem_space_id, H5I_DATASPACE)))
+            HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a dataspace")
+
+        /* Check for valid selection */
+        if(H5S_SELECT_VALID(dset_info->mem_space) != TRUE)
+            HGOTO_ERROR(H5E_DATASPACE, H5E_BADRANGE, FAIL, "memory selection+offset not within extent")
+    } /* end if */
+    else
+        dset_info->mem_space = dset_info->file_space;
+
+    /* Get memory datatype */
+    dset_info->mem_type_id = mem_type_id;
+
+    /* Get buffer */
+    dset_info->u = *u_buf;
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5D__init_dset_info() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5D__pre_write
+ *
+ * Purpose:     Preparation for writing data.
+ *
+ * Return:      Non-negative on success/Negative on failure
+ *
+ * Programmer:  Jonathan Kim  Nov, 2013
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5D__pre_write(hid_t file_id, hid_t dxpl_id, size_t count,
+    H5D_dset_info_t *dset_info)
+{
+    H5P_genplist_t *plist;       /* DXPL property list pointer */
+    hbool_t direct_write = FALSE;       /* Flag for direct writing */
+    herr_t ret_value = SUCCEED;  /* Return value */
+
+    FUNC_ENTER_STATIC
+
+    /* check args */
+    HDassert(dxpl_id > 0);
+    HDassert(count > 0);
+    HDassert(dset_info);
+
+    /* Retrieve DXPL for queries below */
+    if(NULL == (plist = H5P_object_verify(dxpl_id, H5P_DATASET_XFER)))
+        HGOTO_ERROR(H5E_PLIST, H5E_BADTYPE, FAIL, "not a dxpl")
+
+    /* Check if direct write or not */
+    if(H5P_get(plist, H5D_XFER_DIRECT_CHUNK_WRITE_FLAG_NAME, &direct_write) < 0)
+        HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, FAIL, "error getting flag for direct chunk write")
+
+    /* Direct chunk write */
+    if(direct_write) {
+        uint32_t direct_filters;        /* Filters already applied to chunk */
+        hsize_t *direct_offset;         /* Offset of chunk */
+        uint32_t direct_datasize;       /* [Pre-compressed] size of chunk */
+        int      sndims;                /* Dataspace rank (signed) */
+        unsigned ndims;                 /* Dataspace rank */
+        hsize_t  dims[H5O_LAYOUT_NDIMS];        /* Dataspace dimensions */
+        hsize_t  internal_offset[H5O_LAYOUT_NDIMS];     /* Internal copy of the chunk offset */
+        unsigned u;                     /* Local index variable */
+
+        /* Sanity check */
+        HDassert(count == 1);
+        /* Verify dataset is chunked */
+        if(H5D_CHUNKED != dset_info[0].dset->shared->layout.type)
+            HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a chunked dataset")
+
+        /* Retrieve parameters for direct chunk write */
+        if(H5P_get(plist, H5D_XFER_DIRECT_CHUNK_WRITE_FILTERS_NAME, &direct_filters) < 0)
+            HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, FAIL, "error getting filter info for direct chunk write")
+        if(H5P_get(plist, H5D_XFER_DIRECT_CHUNK_WRITE_OFFSET_NAME, &direct_offset) < 0)
+            HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, FAIL, "error getting offset info for direct chunk write")
+        if(H5P_get(plist, H5D_XFER_DIRECT_CHUNK_WRITE_DATASIZE_NAME, &direct_datasize) < 0)
+            HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, FAIL, "error getting data size for direct chunk write")
+
+        /* The library's chunking code requires the offset terminates with a
+         * zero. So transfer the offset array to an internal offset array */
+        if((sndims = H5S_get_simple_extent_dims(dset_info[0].dset->shared->space, dims, NULL)) < 0)
+            HGOTO_ERROR(H5E_DATASPACE, H5E_CANTGET, FAIL, "can't retrieve dataspace extent dims")
+        H5_CHECKED_ASSIGN(ndims, unsigned, sndims, int);
+
+        /* Sanity check chunk offset and set up internal offset array */
+        for(u = 0; u < ndims; u++) {
+            /* Make sure the offset doesn't exceed the dataset's dimensions */
+            if(direct_offset[u] > dset_info[0].dset->shared->curr_dims[u])
+                HGOTO_ERROR(H5E_DATASPACE, H5E_BADTYPE, FAIL, "offset exceeds dimensions of dataset")
+
+            /* Make sure the offset fall right on a chunk's boundary */
+            if(direct_offset[u] % dset_info[0].dset->shared->layout.u.chunk.dim[u])
+                HGOTO_ERROR(H5E_DATASPACE, H5E_BADTYPE, FAIL, "offset doesn't fall on chunks's boundary")
+
+            internal_offset[u] = direct_offset[u];
+        } /* end for */
+
+        /* Terminate the offset with a zero */
+        internal_offset[ndims] = 0;
+
+        /* write raw data */
+        if(H5D__chunk_direct_write(dset_info[0].dset, dxpl_id, direct_filters, internal_offset,
+                                   direct_datasize, dset_info[0].u.wbuf) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "can't write chunk directly")
+    } /* end if */
+    else {
+        size_t u;                       /* Local index variable */
+        hbool_t broke_mdset = FALSE;    /* Whether to break multi-dataset option */
+        H5FD_mpio_xfer_t xfer_mode;     /* Parallel I/O transfer mode */
+
+        /* Get the transfer mode */
+        if(H5P_get(plist, H5D_XFER_IO_XFER_MODE_NAME, &xfer_mode) < 0)
+            HGOTO_ERROR(H5E_PLIST, H5E_CANTSET, FAIL, "unable to get value")
+
+        /* In independent mode or with an unsupported layout, for now
+           just write each dataset individually */
+        if(xfer_mode == H5FD_MPIO_INDEPENDENT)
+            broke_mdset = TRUE;
+        else {
+            /* Multi-dset I/O currently supports CHUNKED and internal CONTIGUOUS
+             * only, not external CONTIGUOUS (EFL) or COMPACT.  Fall back to
+             * individual dataset writes if any dataset uses an unsupported layout.
+             */
+            for(u = 0; u < count; u++) {
+                if(!(dset_info[u].dset->shared->layout.type == H5D_CHUNKED ||
+                     (dset_info[u].dset->shared->layout.type == H5D_CONTIGUOUS &&
+                      dset_info[u].dset->shared->layout.ops != H5D_LOPS_EFL))) {
+                    broke_mdset = TRUE;
+                    break;
+                }
+            } /* end for */
+        }
+
+        if(broke_mdset) {
+            /* Write raw data to each dataset by iteself */
+            for(u = 0; u < count; u++)
+                if(H5D__write(file_id, dxpl_id, 1, &dset_info[u]) < 0)
+                    HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "can't write data")
+        } /* end if */
+        else {
+            HDassert(xfer_mode == H5FD_MPIO_COLLECTIVE);
+
+            if(count > 0) {
+                if(H5D__write(file_id, dxpl_id, count, dset_info) < 0)
+                    HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "can't write data")
+            } /* end if */
+
+#ifdef H5_HAVE_PARALLEL
+        /* MSC - I do not think we should allow for this. I think we
+           should make the multi dataset APIs enforce a uniform list
+           of datasets among all processes, and users would enter a
+           NULL selection when a process does not have anything to
+           write to a particulat dataset. */
+            else {
+                if(H5D__match_coll_calls(file_id, plist, FALSE) < 0)
+                    HGOTO_ERROR(H5E_DATASET,  H5E_READERROR, FAIL, "failed in matching collective MPI calls")
+            } /* end else */
+#endif /* H5_HAVE_PARALLEL */
+        } /* end else */
+    } /* end else */
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5D__pre_write() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5D__pre_read
+ *
+ * Purpose:     Sets up a read operation.
+ *
+ * Return:      Non-negative on success/Negative on failure
+ *
+ * Programmer:  Neil Fortner  Apr, 2014
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5D__pre_read(hid_t file_id, hid_t dxpl_id, size_t count,
+    H5D_dset_info_t *dset_info)
+{
+    H5FD_mpio_xfer_t xfer_mode;         /* Parallel I/O transfer mode */
+    hbool_t broke_mdset = FALSE;        /* Whether to break multi-dataset option */
+    size_t u;                           /* Local index variable */
+    H5P_genplist_t     *plist;              /* Property list pointer */
+    H5P_genplist_t     *plist_chunk;              /* Property list pointer */
+    hsize_t         *direct_offset = NULL;
+    hbool_t         direct_read = FALSE;
+    uint32_t        direct_filters = 0;
+    herr_t ret_value = SUCCEED;         /* Return value */
+
+    FUNC_ENTER_STATIC
+
+    /* check args */
+    HDassert(dxpl_id > 0);
+    HDassert(count > 0);
+    HDassert(dset_info);
+
+    /* Retrieve DXPL for queries below */
+    if(NULL == (plist = H5P_object_verify(dxpl_id, H5P_DATASET_XFER)))
+        HGOTO_ERROR(H5E_PLIST, H5E_BADTYPE, FAIL, "not a dxpl")
+
+    /* Get the transfer mode */
+    if(H5P_get(plist, H5D_XFER_IO_XFER_MODE_NAME, &xfer_mode) < 0)
+        HGOTO_ERROR(H5E_PLIST, H5E_CANTSET, FAIL, "unable to get value")
+
+    /* Get the dataset transfer property list */
+    if(NULL == (plist_chunk = (H5P_genplist_t *)H5I_object(dxpl_id)))
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a dataset transfer property list")
+
+    /* Retrieve the 'direct read' flag */
+    if(H5P_get(plist_chunk, H5D_XFER_DIRECT_CHUNK_READ_FLAG_NAME, &direct_read) < 0)
+        HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, FAIL, "error getting flag for direct chunk read")
+
+    if(direct_read) {
+        hsize_t  internal_offset[H5O_LAYOUT_NDIMS];
+
+        if(H5D_CHUNKED != dset_info[0].dset->shared->layout.type)
+            HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a chunked dataset")
+
+        /* Get the direct chunk offset property */
+        if(H5P_get(plist_chunk, H5D_XFER_DIRECT_CHUNK_READ_OFFSET_NAME, &direct_offset) < 0)
+            HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, FAIL, "error getting direct offset from xfer properties")
+
+        /* The library's chunking code requires the offset terminates with a zero. So transfer the
+         * offset array to an internal offset array */
+        for(u = 0; u < dset_info[0].dset->shared->ndims; u++) {
+            /* Make sure the offset doesn't exceed the dataset's dimensions */
+            if(direct_offset[u] > dset_info[0].dset->shared->curr_dims[u])
+                HGOTO_ERROR(H5E_DATASPACE, H5E_BADTYPE, FAIL, "offset exceeds dimensions of dataset")
+
+            /* Make sure the offset fall right on a chunk's boundary */
+            if(direct_offset[u] % dset_info[0].dset->shared->layout.u.chunk.dim[u])
+                HGOTO_ERROR(H5E_DATASPACE, H5E_BADTYPE, FAIL, "offset doesn't fall on chunks's boundary")
+
+            internal_offset[u] = direct_offset[u];
+        } /* end for */
+
+        /* Terminate the offset with a zero */
+        internal_offset[dset_info[0].dset->shared->ndims] = 0;
+        /* Read the raw chunk */
+        if(H5D__chunk_direct_read(dset_info[0].dset, dxpl_id, internal_offset, &direct_filters, dset_info[0].u.rbuf) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_READERROR, FAIL, "can't read chunk directly")
+        /* Set the chunk filter mask property */
+        if(H5P_set(plist_chunk, H5D_XFER_DIRECT_CHUNK_READ_FILTERS_NAME, &direct_filters) < 0)
+            HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, FAIL, "error setting filter mask xfer property")
+    }
+    else {
+
+      /* In independent mode or with an unsupported layout, for now just
+         read each dataset individually */
+      if(xfer_mode == H5FD_MPIO_INDEPENDENT)
+        broke_mdset = TRUE;
+      else {
+        /* Multi-dset I/O currently supports CHUNKED and internal CONTIGUOUS
+         * only, not external CONTIGUOUS (EFL) or COMPACT.  Fall back to
+         * individual dataset reads if any dataset uses an unsupported layout.
+         */
+        for(u = 0; u < count; u++) {
+          if(!(dset_info[u].dset->shared->layout.type == H5D_CHUNKED ||
+               (dset_info[u].dset->shared->layout.type == H5D_CONTIGUOUS &&
+                dset_info[u].dset->shared->layout.ops != H5D_LOPS_EFL))) {
+            broke_mdset = TRUE;
+            break;
+          }
+        } /* end for */
+      }
+      if(broke_mdset) {
+        /* Read raw data from each dataset by iteself */
+        for(u = 0; u < count; u++)
+          if(H5D__read(file_id, dxpl_id, 1, &dset_info[u]) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_READERROR, FAIL, "can't read data")
+              } /* end if */
+      else {
+        HDassert(xfer_mode == H5FD_MPIO_COLLECTIVE);
+
+        if(count > 0) {
+          if(H5D__read(file_id, dxpl_id, count, dset_info) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_READERROR, FAIL, "can't read data")
+              } /* end if */
+#ifdef H5_HAVE_PARALLEL
+        /* MSC - I do not think we should allow for this. I think we
+           should make the multi dataset APIs enforce a uniform list
+           of datasets among all processes, and users would enter a
+           NULL selection when a process does not have anything to
+           write to a particulat dataset. */
+        else {
+          if(H5D__match_coll_calls(file_id, plist, TRUE) < 0)
+            HGOTO_ERROR(H5E_DATASET,  H5E_READERROR, FAIL, "failed in matching collective MPI calls")
+              } /* end else */
+#endif /* H5_HAVE_PARALLEL */
+      } /* end else */
+    }
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5D__pre_read() */
+
+
+
+herr_t
+H5Dwrite_multi(hid_t dxpl_id, size_t count, const H5D_rw_multi_t *info)
+{
+    H5D_dset_info_t *dset_info = NULL;  /* Pointer to internal list of multi-dataset info */
+    size_t u;                           /* Local index variable */
+    hid_t file_id;                      /* file ID where datasets are located */
+    herr_t  ret_value = SUCCEED;        /* Return value */
+
+    FUNC_ENTER_API(FAIL)
+    H5TRACE3("e", "iz*Dm", dxpl_id, count, info);
+
+    if(count <= 0)
+        HGOTO_DONE(SUCCEED)
+
+    /* Get the default dataset transfer property list if the user didn't provide one */
+    if(H5P_DEFAULT == dxpl_id)
+        dxpl_id = H5P_DATASET_XFER_DEFAULT;
+    else
+        if(TRUE != H5P_isa_class(dxpl_id, H5P_DATASET_XFER))
+            HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not xfer parms")
+
+    /* Alloc dset_info */
+    if(NULL == (dset_info = (H5D_dset_info_t *)H5MM_calloc(count * sizeof(H5D_dset_info_t))))
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTALLOC, FAIL, "couldn't allocate dset info array buffer")
+
+    /* Translate public multi-dataset info to internal structure */
+    /* (And check parameters) */
+    for(u = 0; u < count; u++) {
+        if(H5D__init_dset_info(&dset_info[u], info[u].dset_id, info[u].mem_type_id, info[u].mem_space_id,
+                               info[u].dset_space_id, &(info[u].u.wbuf)) < 0)
+            HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "can't init dataset info")
+    }
+
+    if((file_id = H5D__verify_location(count, dset_info)) < 0)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "datasets are not in the same file")
+
+    /* Call common pre-write routine */
+    if(H5D__pre_write(file_id, dxpl_id, count, dset_info) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "can't prepare for writing data")
+
+done:
+    if(dset_info)
+        H5MM_xfree(dset_info);
+
+    FUNC_LEAVE_API(ret_value)
+} /* end H5Dwrite_multi() */
+
+
+herr_t
+H5Dread_multi(hid_t dxpl_id, size_t count, H5D_rw_multi_t *info)
+{
+    H5D_dset_info_t *dset_info = NULL;  /* Pointer to internal list of multi-dataset info */
+    size_t u;                           /* Local index variable */
+    hid_t file_id;                      /* file ID where datasets are located */
+    herr_t ret_value = SUCCEED;         /* Return value */
+
+    FUNC_ENTER_API(FAIL)
+    H5TRACE3("e", "iz*Dm", dxpl_id, count, info);
+
+    if(count <= 0)
+        HGOTO_DONE(SUCCEED)
+
+    /* Get the default dataset transfer property list if the user didn't provide one */
+    if(H5P_DEFAULT == dxpl_id)
+        dxpl_id = H5P_DATASET_XFER_DEFAULT;
+    else
+        if(TRUE != H5P_isa_class(dxpl_id, H5P_DATASET_XFER))
+            HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not xfer parms")
+
+    /* Alloc dset_info */
+    if(NULL == (dset_info = (H5D_dset_info_t *)H5MM_calloc(count * sizeof(H5D_dset_info_t))))
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTALLOC, FAIL, "couldn't allocate dset info array buffer")
+
+    /* Translate public multi-dataset info to internal structure */
+    /* (And check parameters) */
+    for(u = 0; u < count; u++) {
+        if(H5D__init_dset_info(&dset_info[u], info[u].dset_id, info[u].mem_type_id, info[u].mem_space_id,
+                               info[u].dset_space_id, &(info[u].u.rbuf)) < 0)
+            HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "can't init dataset info")
+    } /* end for */
+
+    if((file_id = H5D__verify_location(count, dset_info)) < 0)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "datasets are not in the same file")
+
+    /* Call common pre-read routine */
+    if(H5D__pre_read(file_id, dxpl_id, count, dset_info) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_READERROR, FAIL, "can't prepare for reading data")
+
+done:
+    if(dset_info)
+        H5MM_xfree(dset_info);
+
+    FUNC_LEAVE_API(ret_value)
+} /* end H5Dread_multi() */
 
 /*-------------------------------------------------------------------------
  * Function:	H5D__ioinfo_init

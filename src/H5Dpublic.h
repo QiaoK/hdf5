@@ -102,6 +102,18 @@ typedef enum H5D_vds_view_t {
     H5D_VDS_LAST_AVAILABLE = 1
 } H5D_vds_view_t;
 
+typedef struct H5D_rw_multi_t
+{
+    hid_t dset_id;          /* dataset ID */
+    hid_t dset_space_id;    /* dataset selection dataspace ID */
+    hid_t mem_type_id;      /* memory datatype ID */
+    hid_t mem_space_id;     /* memory selection dataspace ID */
+    union {
+        void *rbuf;         /* pointer to read buffer */
+        const void *wbuf;   /* pointer to write buffer */
+    } u;
+} H5D_rw_multi_t;
+
 /* Callback for H5Pset_append_flush() in a dataset access property list */
 typedef herr_t (*H5D_append_cb_t)(hid_t dataset_id, hsize_t *cur_dims, void *op_data);
 
@@ -1080,6 +1092,9 @@ H5_DLL herr_t H5Dwrite_chunk(hid_t dset_id, hid_t dxpl_id, uint32_t filters, con
  */
 H5_DLL herr_t H5Dread_chunk(hid_t dset_id, hid_t dxpl_id, const hsize_t *offset, uint32_t *filters,
                             void *buf);
+
+H5_DLL herr_t H5Dread_multi(hid_t dxpl_id, size_t count, H5D_rw_multi_t *info);
+H5_DLL herr_t H5Dwrite_multi(hid_t dxpl_id, size_t count, const H5D_rw_multi_t *info);
 
 /**
  * --------------------------------------------------------------------------

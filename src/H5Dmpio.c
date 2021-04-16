@@ -3414,4 +3414,90 @@ done:
 
     FUNC_LEAVE_NOAPI(ret_value)
 } /* end H5D__filtered_collective_chunk_entry_io() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5D_match_coll_calls
+ *
+ * Purpose: For processes that are not reading/writing to a particular
+ * datasets through the multi-dataset interface, but are participating
+ * in the collective call, match the collective I/O calls from the
+ * other processes.
+ *
+ * Return:      non-negative on success, negative on failure.
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5D__match_coll_calls(hid_t file_id, H5P_genplist_t *plist, hbool_t do_read)
+{
+    int local_cause = 0;
+    int global_cause = 0;
+    int mpi_code;
+    H5F_t *file;
+    H5FD_mpio_collective_opt_t para_io_mode;
+    H5FD_mpio_xfer_t xfer_mode;
+    herr_t ret_value = SUCCEED;
+
+    FUNC_ENTER_PACKAGE
+
+    HDassert(file_id > 0);
+
+    /* Get the transfer mode */
+    if(H5P_get(plist, H5D_XFER_IO_XFER_MODE_NAME, &xfer_mode) < 0)
+        HGOTO_ERROR(H5E_PLIST, H5E_CANTSET, FAIL, "unable to get value")
+    HDassert(xfer_mode == H5FD_MPIO_COLLECTIVE);
+
+    /* get parallel io mode */
+    if(H5P_get(plist, H5D_XFER_MPIO_COLLECTIVE_OPT_NAME, &para_io_mode) < 0)
+        HGOTO_ERROR(H5E_PLIST, H5E_CANTSET, FAIL, "unable to get value")
+
+    if(NULL == (file = (H5F_t *)H5I_object_verify(file_id, H5I_FILE)))
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a file")
+
+    /* just to match up with MPI_Allreduce from H5D__mpio_opt_possible() */
+    if(MPI_SUCCESS != (mpi_code = MPI_Allreduce(&local_cause, &global_cause, 1,
+                                                MPI_INT, MPI_BOR, H5F_mpi_get_comm(file))))
+        HMPI_GOTO_ERROR(FAIL, "MPI_Allreduce failed", mpi_code)
+
+    /* if collective mode is not broken according to the
+     * H5D__mpio_opt_possible, since the below MPI funcs will be
+     * called only in collective mode */
+    if(!global_cause) {
+        MPI_Status mpi_stat;
+        MPI_File mpi_fh_p;
+        MPI_File mpi_fh;
+
+        if(H5F_get_mpi_handle(file, (MPI_File **)&mpi_fh_p) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_CANTGET, FAIL, "can't get mpi file handle")
+        mpi_fh = *(MPI_File*)mpi_fh_p;
+
+        /* just to match up with the 1st MPI_File_set_view from H5FD_mpio_read() */
+        if(MPI_SUCCESS != (mpi_code = MPI_File_set_view(mpi_fh, (MPI_Offset)0, MPI_BYTE,
+                                                        MPI_BYTE, "native", MPI_INFO_NULL)))
+            HMPI_GOTO_ERROR(FAIL, "MPI_File_set_view failed", mpi_code)
+
+        /* just to match up with MPI_File_write_at_all from H5FD_mpio_read() */
+        if(para_io_mode == H5FD_MPIO_COLLECTIVE_IO)  {
+            HDmemset(&mpi_stat, 0, sizeof(MPI_Status));
+            if(do_read) {
+                if(MPI_SUCCESS != (mpi_code = MPI_File_read_at_all(mpi_fh, 0, NULL, 0, MPI_BYTE, &mpi_stat)))
+                    HMPI_GOTO_ERROR(FAIL, "MPI_File_read_at_all failed", mpi_code)
+            }
+            else {
+                if(MPI_SUCCESS != (mpi_code = MPI_File_write_at_all(mpi_fh, 0, NULL, 0, MPI_BYTE, &mpi_stat)))
+                    HMPI_GOTO_ERROR(FAIL, "MPI_File_write_at_all failed", mpi_code)
+            }
+        } /* end if */
+
+        /* just to match up with the 2nd MPI_File_set_view (reset) in H5FD_mpio_read() */
+        if(MPI_SUCCESS != (mpi_code = MPI_File_set_view(mpi_fh, (MPI_Offset)0, MPI_BYTE, MPI_BYTE,
+                                                        "native", MPI_INFO_NULL)))
+            HMPI_GOTO_ERROR(FAIL, "MPI_File_set_view failed", mpi_code)
+    } /* end if !global_cause */
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* H5FD_match_coll_calls */
+
 #endif /* H5_HAVE_PARALLEL */

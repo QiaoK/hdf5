@@ -211,6 +211,54 @@ typedef enum H5D_io_op_type_t {
     H5D_IO_OP_WRITE /* Write operation */
 } H5D_io_op_type_t;
 
+
+typedef union H5D_dset_buf_t {
+    void *rbuf;                 /* Pointer to buffer for read */
+    const void *wbuf;           /* Pointer to buffer to write */
+} H5D_dset_buf_t;
+
+/* dset info for multiple dsets */
+typedef struct H5D_dset_info_t {
+    H5D_t *dset;                /* Pointer to dataset being operated on */
+    H5D_storage_t *store;       /* Dataset storage info */
+    H5D_layout_ops_t layout_ops;    /* Dataset layout I/O operation function pointers */
+    H5D_dset_buf_t u;           /* Buffer pointer */
+
+    H5O_layout_t *layout;       /* Dataset layout information*/
+    hsize_t nelmts;             /* Number of elements selected in file & memory dataspaces */
+
+    const H5S_t *file_space;    /* Pointer to the file dataspace */
+    unsigned f_ndims;           /* Number of dimensions for file dataspace */
+    hsize_t f_dims[H5O_LAYOUT_NDIMS];   /* File dataspace dimensions */
+
+    const H5S_t *mem_space;     /* Pointer to the memory dataspace */
+    H5S_t *mchunk_tmpl;         /* Dataspace template for new memory chunks */
+    H5S_sel_iter_t mem_iter;    /* Iterator for elements in memory selection */
+    unsigned m_ndims;           /* Number of dimensions for memory dataspace */
+    H5S_sel_type msel_type;     /* Selection type in memory */
+    H5S_sel_type fsel_type;     /* Selection type in file */
+
+    H5SL_t *dset_sel_pieces;    /* Skiplist of selected pieces in this dataset, indexed by index */
+
+    H5S_t  *single_space;       /* Dataspace for single chunk */
+    H5D_chunk_info_t *single_chunk_info;
+    hbool_t use_single;         /* Whether I/O is on a single element */
+
+    hsize_t last_index;         /* Index of last chunk operated on */
+    H5D_chunk_info_t *last_piece_info;  /* Pointer to last piece's info */
+
+    hsize_t chunk_dim[H5O_LAYOUT_NDIMS];    /* Size of chunk in each dimension */
+
+    hid_t mem_type_id;          /* memory datatype ID */
+    H5D_type_info_t type_info;
+    hbool_t type_info_init;
+
+#ifdef H5_HAVE_PARALLEL
+    H5D_chunk_info_t **select_chunk;    /* Store the information about whether this chunk is selected or not */
+#endif /* H5_HAVE_PARALLEL */
+
+} H5D_dset_info_t;
+
 typedef struct H5D_io_info_t {
     const H5D_t *dset;  /* Pointer to dataset being operated on */
                         /* QAK: Delete the f_sh field when oloc has a shared file pointer? */
@@ -727,6 +775,8 @@ H5_DLL herr_t H5D__chunk_collective_write(H5D_io_info_t *io_info, const H5D_type
  * memory and the file */
 H5_DLL htri_t H5D__mpio_opt_possible(const H5D_io_info_t *io_info, const H5S_t *file_space,
                                      const H5S_t *mem_space, const H5D_type_info_t *type_info);
+
+H5_DLL herr_t H5D__match_coll_calls(hid_t file_id, H5P_genplist_t *plist, hbool_t do_read);
 
 #endif /* H5_HAVE_PARALLEL */
 
