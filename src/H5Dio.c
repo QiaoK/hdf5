@@ -587,10 +587,10 @@ H5D__verify_location(size_t count, const H5D_dset_info_t *info)
 
     FUNC_ENTER_STATIC
 
-    file_id = H5F_get_file_id(info[0].dset->oloc.file);
+    file_id = H5F_get_file_id(info[0].dset->oloc.file, H5I_DATASET, TRUE);
 
     for(u = 1; u < count; u++) {
-        if(file_id != H5F_get_file_id(info[u].dset->oloc.file))
+        if(file_id != H5F_get_file_id(info[u].dset->oloc.file, H5I_DATASET, TRUE))
             HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "dataset's file ID doesn't match file_id parameter")
     } /* end for */
 
@@ -890,7 +890,7 @@ H5D__pre_read(hid_t file_id, hid_t dxpl_id, size_t count,
         /* Terminate the offset with a zero */
         internal_offset[dset_info[0].dset->shared->ndims] = 0;
         /* Read the raw chunk */
-        if(H5D__chunk_direct_read(dset_info[0].dset, dxpl_id, internal_offset, &direct_filters, dset_info[0].u.rbuf) < 0)
+        if(H5D__chunk_direct_read(dset_info[0].dset, internal_offset, &direct_filters, dset_info[0].u.rbuf) < 0)
             HGOTO_ERROR(H5E_DATASET, H5E_READERROR, FAIL, "can't read chunk directly")
         /* Set the chunk filter mask property */
         if(H5P_set(plist_chunk, H5D_XFER_DIRECT_CHUNK_READ_FILTERS_NAME, &direct_filters) < 0)
